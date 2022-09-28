@@ -1,0 +1,423 @@
+import math
+import timeit
+
+blocks_in_directory = 32768
+BLOCK_SIZE = 0
+directory = [0] * blocks_in_directory
+DT = []
+FAT = [-2] * blocks_in_directory
+fat_extra_byte = 4
+
+create_time = 0.0
+access_time = 0.0
+extend_time = 0.0
+shrink_time = 0.0
+
+
+# returns number of blocks of the file that is used to subtract from blocks_in_directory after completion,
+# if there is no space in the directory to create that file it returns -1.
+def create_table(file_id, file_length):
+    # even though this is linked allocation, if there is enough contiguous space, it allocates the files in a
+    # contiguous manner. Meaning FAT looks like this: 1 -> 2 -> 3 -> 4 -> ....
+    # it does not randomly places the blocks of the file in directory. It checks the empty blocks in increasing order
+    # and it allocates the blocks in increasing order.
+
+    global create_time
+    start = timeit.default_timer()
+
+    num_block = math.ceil(file_length / BLOCK_SIZE)
+    num_block = math.ceil((file_length + fat_extra_byte * num_block) / BLOCK_SIZE)
+    # num_block calculated again with pointer * num_block size added.
+
+    if num_block <= blocks_in_directory: # if here is enough space to create that file
+        starting_index = 0
+        # FAT[prev_index] will be set to -1 at the end, to indicate the end of the file
+        prev_index = -1
+        # holds the empty block number
+        counter = 0
+
+        while counter < num_block:
+            for index, block in enumerate(directory[prev_index + 1:], start=prev_index + 1):
+                if block == 0:
+                    counter += 1
+                    directory[index] = 1
+                    if counter == 1:
+                        starting_index = index
+                    else:
+                        FAT[prev_index] = index
+                    prev_index = index
+                    break
+        else:
+            FAT[prev_index] = -1
+            elt = {
+                "file_id": file_id,
+                "starting_index": starting_index,
+                "file_length": file_length
+            }
+            DT.append(elt)
+            stop = timeit.default_timer()
+            create_time += stop - start
+            return num_block
+    stop = timeit.default_timer()
+    create_time += stop - start
+    return -1
+
+
+# returns directory address of that byte, and returns -1 if cannot access to that byte in the file.
+def access(file_id, byte_offset):
+    # by using the pointers in FAT, this method goes to the requested block by going block by block in FAT.
+    global access_time
+    start = timeit.default_timer()
+
+    block_that_has_byte = math.ceil(byte_offset / BLOCK_SIZE)
+    # for example if it is the 3000. byte of the file, it is in the 3000/BLOCK_SIZE. block of that file
+    for file in DT:
+        starting_index = file["starting_index"]
+        if file_id == file["file_id"]:
+            if byte_offset <= file["file_length"]:
+                index = starting_index
+                pointer = index
+                prev_of_last_pointer = index
+                for i in range(block_that_has_byte - 1):
+                    if pointer != -1 and pointer != -2:
+                        prev_of_last_pointer = pointer
+                        pointer = FAT[pointer]
+                    else:
+                        pointer = prev_of_last_pointer
+                if block_that_has_byte == 1:
+                    result = byte_offset
+                else:
+                    result = (pointer - 1) * BLOCK_SIZE + byte_offset - ((block_that_has_byte - 1) * BLOCK_SIZE)
+                stop = timeit.default_timer()
+                access_time += stop - start
+                return result
+    stop = timeit.default_timer()
+    access_time += stop - start
+    return -1
+
+# returns 0 if comes to the base case.
+def recursive_extend(extension, counter, prev_index, list_index):
+    # this method updates directory and FAT recursively.
+
+    # this is the extension part, if it can make it extension number of times, returns 0.
+    if extension == 0:
+        FAT[prev_index] = -1
+        return 0
+    for index, block in enumerate(directory[list_index+1:], start=list_index+1):
+        if block == 0:
+            FAT[prev_index] = index
+            directory[index] = 1
+            return recursive_extend(extension - 1, counter + 1, index, index)
+
+
+# returns the number of blocks that is extended with taking into account the pointer size of FAT, in the main,
+# I subtract this from the total available block number. If cannot extend it returns -1.
+def extend(file_id, extension):
+    # like in create operation it allocates the blocks in both directory and FAT in increasing order. First, checks if
+    # there is enough space in memory to perform extension, if there is, then starts extending after the last block
+    # index of the file to be extended, if it goes to the very end of the directory filling blocks,
+    # it starts again from the beginning of the directory.
+
+    global extend_time
+    start = timeit.default_timer()
+
+    if extension <= blocks_in_directory:
+
+        for index, file in enumerate(DT):
+            if file_id == file["file_id"]:
+                block_num = math.ceil(file["file_length"] / BLOCK_SIZE)
+                total_bytes = file["file_length"] + block_num * fat_extra_byte
+                initial_block_num = math.ceil(total_bytes / BLOCK_SIZE)
+                starting_index = file["starting_index"]
+                prev_index = starting_index
+                last_block_index = 0
+
+                while prev_index != -1:
+                    last_block_index = prev_index
+                    prev_index = FAT[prev_index]
+
+                # updates directory and FAT
+                recursive_extend(extension, 0, last_block_index, -1)
+                total_bytes_final = file["file_length"] + (BLOCK_SIZE * extension) + (extension * fat_extra_byte)
+                end_block_num = math.ceil(total_bytes_final / BLOCK_SIZE)
+                to_be_decreased = end_block_num - initial_block_num
+                # I took the pointer sizes into account and calculated first how many bytes should be decreased from the
+                # total memory and then converted it to block type. And in the main method, I decreased this block
+                # number from current available blocks
+                file["file_length"] = file["file_length"] + (extension * BLOCK_SIZE)
+
+                stop = timeit.default_timer()
+                extend_time += stop - start
+                return to_be_decreased
+
+    stop = timeit.default_timer()
+    extend_time += stop - start
+    return -1
+
+
+# returns the number of blocks that is shrunk with taking into account the pointer size of FAT, in the main,
+# I add this to the total available block number. If cannot shrink it returns -1.
+def shrink(file_id, shrinking):
+    # by using the information of FAT holding -1 at the end of the file, it goes to the end block of the file first,
+    # then starts removing the blocks by starting from the last block and going in reversed order exactly shrinking
+    # times using the pointers of FAT to go back.
+
+    global shrink_time
+    start = timeit.default_timer()
+
+    original_shrinking = shrinking
+    # since I remove shrinking as I remove blocks I hold the original value here
+    for index, file in enumerate(DT):
+        if file_id == file["file_id"]:
+
+            n_block = math.ceil(file["file_length"] / BLOCK_SIZE)
+            total_bytes = file["file_length"] + n_block * fat_extra_byte
+            initial_blocks = math.ceil(total_bytes / BLOCK_SIZE)
+
+            # if file has enough blocks to shrink, and not to be deleted entirely.
+            if n_block > shrinking:
+                starting_index = file["starting_index"]
+                prev_index = starting_index
+                last_block_index = 0
+                # for going to the end of the file
+                while prev_index != -1:
+                    last_block_index = prev_index
+                    prev_index = FAT[prev_index]
+                # when we reach the end pointer_index = -1
+                pointer_index = last_block_index
+
+                # removing process until shrinking == 0
+                while (shrinking > 0) and (pointer_index != -1):
+                    shrinking -= 1
+                    FAT[pointer_index] = -2
+                    directory[pointer_index] = 0
+                    for i, next_index in enumerate(FAT):
+                        if next_index == pointer_index:
+                            pointer_index = i
+                            break
+                    else:
+                        pointer_index = -1
+                        break
+                FAT[pointer_index] = -1
+
+                # to decrease the number of blocks from the memory, I first calculate how many byte should be decreased
+                # considering the FAT pointer sizes, and then convert bytes back to that blocks.
+                total_bytes_final = file["file_length"] - (BLOCK_SIZE * original_shrinking) - \
+                                    (original_shrinking * fat_extra_byte)
+                end_blocks = math.ceil(total_bytes_final / BLOCK_SIZE)
+                result = initial_blocks - end_blocks
+
+                file["file_length"] = file["file_length"] - (original_shrinking * BLOCK_SIZE)
+                stop = timeit.default_timer()
+                shrink_time += stop - start
+                return result
+    stop = timeit.default_timer()
+    shrink_time += stop - start
+    return -1
+
+
+def main():
+    global BLOCK_SIZE
+    global blocks_in_directory
+    file_id = 0
+
+    create_average_time = 0
+    access_average_time = 0
+    extend_average_time = 0
+    shrink_average_time = 0
+
+    file_names = ['input_1024_200_9_0_9.txt', 'input_1024_200_9_0_0.txt',
+                  'input_2048_600_5_5_0.txt', 'input_8_600_5_5_0.txt', 'input_1024_200_5_9_9.txt']
+
+    for file in file_names:
+        file_address = "./io/" + file
+        create_success = 0
+        create_reject = 0
+        access_success = 0
+        access_reject = 0
+        extend_success = 0
+        extend_reject = 0
+        shrink_success = 0
+        shrink_reject = 0
+        with open(file_address, "r") as a_file:
+            BLOCK_SIZE = int(a_file.name.strip().rsplit('_')[1])
+            counter = 0
+            for line in a_file:
+                counter += 1
+                stripped_line = line.strip()
+                operation = stripped_line[0]
+                if operation == 'c':
+                    file_length = int(stripped_line.rsplit(':')[1])
+                    num_block = create_table(file_id, file_length)
+                    if num_block != -1:
+                        blocks_in_directory -= num_block
+                        file_id += 1
+                        create_success += 1
+                    else:
+                        create_reject += 1
+                elif operation == 'a':
+                    file_id_for_access = int(stripped_line.rsplit(':')[1])
+                    byte_offset = int(stripped_line.rsplit(':')[2])
+                    directory_address = access(file_id_for_access, byte_offset)
+                    if directory_address != -1:
+                        access_success += 1
+                    else:
+                        access_reject += 1
+                elif operation == 'e':
+                    file_id_for_extend = int(stripped_line.rsplit(':')[1])
+                    extension = int(stripped_line.rsplit(':')[2])
+                    extension_block = extend(file_id_for_extend, extension)
+                    if extension_block != -1:
+                        blocks_in_directory -= extension_block
+                        extend_success += 1
+                    else:
+                        extend_reject += 1
+                elif operation == 's':
+                    file_id_for_shrink = int(stripped_line.rsplit(':')[1])
+                    shrink_block = int(stripped_line.rsplit(':')[2])
+                    shrink_result = shrink(file_id_for_shrink, shrink_block)
+                    if shrink_result != -1:
+                        blocks_in_directory += shrink_block
+                        shrink_success += 1
+                    else:
+                        shrink_reject += 1
+
+        create_average_time += create_time / (create_success + create_reject)
+        access_average_time += access_time / (access_success + access_reject)
+
+        print(file_address)
+        print("\n")
+        print("CREATED FILE NUMBER: ", create_success)
+        print("CREATE REJECTED FILE NUMBER: ", create_reject)
+        print("create time: ", create_time / (create_success + create_reject))
+        print("ACCESSED FILE NUMBER: ", access_success)
+        print("ACCESS REJECTED FILE NUMBER: ", access_reject)
+        print("access time: ", access_time / (access_success + access_reject))
+        if extend_success + extend_reject != 0:
+            print("EXTENDED FILE NUMBER: ", extend_success)
+            print("EXTEND REJECTED FILE NUMBER: ", extend_reject)
+            print("extend time: ", extend_time / (extend_success + extend_reject))
+            extend_average_time += extend_time / (extend_success + extend_reject)
+        else:
+            print("EXTENDED FILE NUMBER: ", extend_success)
+            print("EXTEND REJECTED FILE NUMBER: ", extend_reject)
+        if shrink_success + shrink_reject != 0:
+            print("SHRUNK FILE NUMBER: ", shrink_success)
+            print("SHRINK REJECTED FILE NUMBER: ", shrink_reject)
+            print("shrink time: ", shrink_time / (shrink_success + shrink_reject))
+            shrink_average_time += shrink_time / (shrink_success + shrink_reject)
+        else:
+            print("SHRUNK FILE NUMBER: ", shrink_success)
+            print("SHRINK REJECTED FILE NUMBER: ", shrink_reject)
+        print("\n")
+
+    print("Average create time: ", create_average_time / 5)
+    print("Average access time: ", access_average_time / 5)
+    print("Average extend time: ", extend_average_time / 5)
+    print("Average shrink time: ", shrink_average_time / 5)
+
+
+# def main():
+#     global BLOCK_SIZE
+#     global blocks_in_directory
+#     file_id = 0
+#
+#     c_average = 0.0
+#     a_average = 0.0
+#     e_average = 0.0
+#     sh_average = 0.0
+#
+#     files = ['input_2048_600_5_5_0.txt', 'input_8_600_5_5_0.txt', 'input_1024_200_5_9_9.txt',
+#              'input_1024_200_9_0_9.txt', 'input_1024_200_9_0_0.txt']
+#
+#     for file in files:
+#         file_path = "./io/" + file
+#         # 1 for success, 2 for reject
+#         a_count_1 = 0
+#         a_count_2 = 0
+#         c_count_1 = 0
+#         c_count_2 = 0
+#         e_count_1 = 0
+#         e_count_2 = 0
+#         sh_count_1 = 0
+#         sh_count_2 = 0
+#         with open(file_path, "r") as a_file:
+#             BLOCK_SIZE = int(a_file.name.strip().rsplit('_')[1])
+#             counter = 0
+#             for line in a_file:
+#                 counter += 1
+#                 stripped_line = line.strip()
+#                 operation = stripped_line[0]
+#                 if operation == 'c':
+#                     file_length = int(stripped_line.rsplit(':')[1])
+#                     num_block = create_table(file_id, file_length)
+#                     if num_block != -1:
+#                         blocks_in_directory -= num_block
+#                         file_id += 1
+#                         c_count_1 += 1
+#                     else:
+#                         c_count_2 += 1
+#                 elif operation == 'a':
+#                     file_id_for_access = int(stripped_line.rsplit(':')[1])
+#                     byte_offset = int(stripped_line.rsplit(':')[2])
+#                     directory_address = access(file_id_for_access, byte_offset)
+#                     if directory_address != -1:
+#                         a_count_1 += 1
+#                     else:
+#                         a_count_2 += 1
+#                 elif operation == 'e':
+#                     file_id_for_extend = int(stripped_line.rsplit(':')[1])
+#                     extension = int(stripped_line.rsplit(':')[2])
+#                     extension_block = extend(file_id_for_extend, extension)
+#                     if extension_block != -1:
+#                         blocks_in_directory -= extension_block
+#                         e_count_1 += 1
+#                     else:
+#                         e_count_2 += 1
+#                 elif operation == 's':
+#                     file_id_for_shrink = int(stripped_line.rsplit(':')[1])
+#                     shrink_block = int(stripped_line.rsplit(':')[2])
+#                     shrink_result = shrink(file_id_for_shrink, shrink_block)
+#                     if shrink_result != -1:
+#                         blocks_in_directory += shrink_block
+#                         sh_count_1 += 1
+#                     else:
+#                         sh_count_2 += 1
+#
+#         c_average += create_time / (c_count_1 + c_count_2)
+#         a_average += access_time / (a_count_1 + a_count_2)
+#
+#         print("File name: ", file)
+#         print("\n")
+#         print("CREATED FILE NUMBER: ", c_count_1)
+#         print("CREATE REJECTED FILE NUMBER: ", c_count_2)
+#         print("create time: ", create_time / (c_count_1 + c_count_2))
+#         print("ACCESSED FILE NUMBER: ", a_count_1)
+#         print("ACCESS REJECTED FILE NUMBER: ", a_count_2)
+#         print("access time: ", access_time / (a_count_1 + a_count_2))
+#         if e_count_1 + e_count_2 != 0:
+#             print("EXTENDED FILE NUMBER: ", e_count_1)
+#             print("EXTEND REJECTED FILE NUMBER: ", e_count_2)
+#             print("extend time: ", extend_time / (e_count_1 + e_count_2))
+#             e_average += extend_time / (e_count_1 + e_count_2)
+#         else:
+#             print("EXTENDED FILE NUMBER: ", e_count_1)
+#             print("EXTEND REJECTED FILE NUMBER: ", e_count_2)
+#         if sh_count_1 + sh_count_2 != 0:
+#             print("SHRUNK FILE NUMBER: ", sh_count_1)
+#             print("SHRINK REJECTED FILE NUMBER: ", sh_count_2)
+#             print("shrink time: ", shrink_time / (sh_count_1 + sh_count_2))
+#             sh_average += shrink_time / (sh_count_1 + sh_count_2)
+#         else:
+#             print("SHRUNK FILE NUMBER: ", sh_count_1)
+#             print("SHRINK REJECTED FILE NUMBER: ", sh_count_2)
+#         print("\n")
+#
+#     print("Average create time: ", c_average / 5)
+#     print("Average access time: ", a_average / 5)
+#     print("Average extend time: ", e_average / 5)
+#     print("Average shrink time: ", sh_average / 5)
+
+
+if __name__ == "__main__":
+    main()
